@@ -1473,16 +1473,81 @@ if (READONLY_MODE) {
   safetyInfo = C.dim("  Permission prompts ENABLED");
 }
 
-const startProvider = getProvider();
-const providerTag = C.cyan(`${detectProvider(config.model)}:${config.model}`);
-const keyOk = process.env[startProvider.keyEnv];
-const keyTag = keyOk ? C.green("✓ KEY") : C.yellow(`✗ ${startProvider.keyEnv} missing`);
+function showBanner() {
+  const p = getProvider();
+  const pTag = C.cyan(`${detectProvider(config.model)}:${config.model}`);
+  const kOk = process.env[p.keyEnv];
+  const kTag = kOk ? C.green("✓ KEY") : C.yellow(`✗ ${p.keyEnv} missing`);
 
-console.log(`
-${C.bold(C.cyan("  Omni"))}  ${modeTag}  ${providerTag}  ${keyTag}
+  console.log(`
+${C.bold(C.cyan("  Omni"))}  ${modeTag}  ${pTag}  ${kTag}
 ${safetyInfo}
 ${C.dim("  /help for commands — exit to quit — \"\"\" for multi-line")}
 ${C.dim("  /model to switch models — /provider to switch providers")}
 `);
+}
 
-prompt();
+function showModelPicker() {
+  return new Promise((resolve) => {
+    console.log(`\n${C.bold(C.cyan("  Omni"))} — ${C.dim("Multi-Provider AI Coding Assistant")}\n`);
+
+    // Build numbered model list
+    const choices = [];
+    for (const [id, p] of Object.entries(PROVIDERS)) {
+      const hasKey = !!process.env[p.keyEnv];
+      const keyIcon = hasKey ? C.green("✓") : C.red("✗");
+      console.log(`  ${C.bold(p.name)} ${keyIcon}`);
+      for (const m of p.models) {
+        choices.push({ model: m, provider: id, providerName: p.name, hasKey });
+        const num = C.dim(`  ${String(choices.length).padStart(2)}.`);
+        const cur = m === config.model ? C.green(" ← current") : "";
+        console.log(`  ${num} ${C.cyan(m)}${cur}`);
+      }
+      if (p.models.length === 0) {
+        choices.push({ model: p.defaultModel, provider: id, providerName: p.name, hasKey });
+        const num = C.dim(`  ${String(choices.length).padStart(2)}.`);
+        console.log(`  ${num} ${C.cyan(p.defaultModel)} ${C.dim("(custom)")}`);
+      }
+    }
+
+    console.log();
+    const currentIdx = choices.findIndex((c) => c.model === config.model);
+    const defaultHint = currentIdx >= 0 ? currentIdx + 1 : 1;
+
+    rl.question(`  ${C.green(">")} Pick model ${C.dim(`[${defaultHint}]`)}: `, (ans) => {
+      const trimmed = ans.trim();
+
+      // Enter = keep current
+      if (!trimmed) {
+        resolve();
+        return;
+      }
+
+      const num = parseInt(trimmed);
+      if (num >= 1 && num <= choices.length) {
+        const pick = choices[num - 1];
+        config.model = pick.model;
+        saveConfig(config);
+        if (!pick.hasKey) {
+          console.log(C.yellow(`\n  Warning: ${PROVIDERS[pick.provider].keyEnv} not set`));
+        }
+      } else if (trimmed.length > 1) {
+        // Typed a model name directly
+        config.model = trimmed;
+        saveConfig(config);
+      }
+
+      resolve();
+    });
+  });
+}
+
+// ── Start ──
+(async () => {
+  // Skip picker if model already specified via -m flag or --resume
+  if (!argModel && !argResume) {
+    await showModelPicker();
+  }
+  showBanner();
+  prompt();
+})();
