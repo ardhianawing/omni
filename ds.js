@@ -24,6 +24,7 @@ const HISTORY_PATH = path.join(DS_DIR, "history");
 // ── CLI Args ──
 const args = process.argv.slice(2);
 const BYPASS_MODE = args.includes("--bypass");
+const READONLY_MODE = process.env.DEEPSEEK_READONLY === "1";
 const argModel = getArg("-m") || getArg("--model");
 const argResume = getArg("-r") || getArg("--resume");
 
@@ -192,14 +193,64 @@ const PRICING = {
 
 function trackUsage(usage) {
   if (!usage) return;
-  sessionTokens.input += usage.prompt_tokens || 0;
-  sessionTokens.output += usage.completion_tokens || 0;
+  const inp = usage.prompt_tokens || 0;
+  const out = usage.completion_tokens || 0;
+  sessionTokens.input += inp;
+  sessionTokens.output += out;
+  if (turnStats) {
+    turnStats.turnTokens.input += inp;
+    turnStats.turnTokens.output += out;
+  }
 }
 
 function tokenStats() {
   const p = PRICING[config.model] || PRICING["deepseek-chat"];
   const cost = (sessionTokens.input / 1e6) * p.input + (sessionTokens.output / 1e6) * p.output;
   return { ...sessionTokens, total: sessionTokens.input + sessionTokens.output, cost: `$${cost.toFixed(6)}` };
+}
+
+// ═══════════════════════════════════════════════════════════
+//  Turn Stats & Session Log
+// ═══════════════════════════════════════════════════════════
+let turnCounter = 0;
+let turnStats = null;
+let sessionLog = [];
+
+function resetTurnStats() {
+  turnStats = {
+    startTime: Date.now(),
+    actions: [],
+    toolsUsed: { read: 0, write: 0, edit: 0, delete: 0, command: 0, search: 0 },
+    turnTokens: { input: 0, output: 0 },
+  };
+}
+
+function logAction(name, args, result, duration) {
+  const entry = {
+    timestamp: new Date().toISOString(),
+    tool: name,
+    args: typeof args === "object" ? { ...args } : args,
+    resultPreview: (result.out || "").substring(0, 120),
+    ok: !!result.ok,
+    duration,
+  };
+  if (turnStats) turnStats.actions.push(entry);
+  sessionLog.push(entry);
+  if (turnStats) {
+    const toolMap = {
+      read_file: "read", write_file: "write", edit_file: "edit",
+      delete_file: "delete", run_command: "command",
+      search_files: "search", search_content: "search",
+    };
+    const key = toolMap[name];
+    if (key) turnStats.toolsUsed[key]++;
+  }
+}
+
+function formatFileSize(bytes) {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -337,43 +388,101 @@ const TOOLS = [
 ];
 
 const SAFE_TOOLS = ["read_file", "search_files", "search_content"];
+const DANGEROUS_TOOLS = ["delete_file", "run_command"];
+const WRITE_TOOLS = ["write_file", "edit_file"];
 
 // ═══════════════════════════════════════════════════════════
-//  Tool Execution
+//  ENHANCED TOOL EXECUTION WITH SAFETY CHECKS
 // ═══════════════════════════════════════════════════════════
 function executeTool(name, a) {
   try {
+    // Additional safety checks before execution
+    if (a.path && !isSafePath(a.path)) {
+      return { ok: false, out: "Safety check failed: Path blocked for security reasons" };
+    }
+    
+    if (name === "run_command" && a.command && isDangerousCommand(a.command)) {
+      return { ok: false, out: "Safety check failed: Command blocked for security reasons" };
+    }
+    
     switch (name) {
       case "run_command":
-        return { ok: true, out: execSync(a.command, { encoding: "utf8", timeout: 60000, cwd: process.cwd(), stdio: ["pipe", "pipe", "pipe"] }) || "(no output)" };
-      case "read_file":
-        return { ok: true, out: fs.readFileSync(a.path, "utf8") };
+        // Additional command safety
+        const dangerousCmds = ['rm ', 'mkfs', 'fdisk', 'dd', 'chmod', 'chown'];
+        const cmdLower = a.command.toLowerCase();
+        const isDangerous = dangerousCmds.some(cmd => cmdLower.includes(cmd));
+        
+        if (isDangerous && !BYPASS_MODE) {
+          return { ok: false, out: "Potentially dangerous command. Use bypass mode with caution." };
+        }
+        
+        const cmdStart = Date.now();
+        const cmdOut = execSync(a.command, { encoding: "utf8", timeout: 60000, cwd: process.cwd(), stdio: ["pipe", "pipe", "pipe"] }) || "(no output)";
+        return { ok: true, out: cmdOut, meta: { duration: ((Date.now() - cmdStart) / 1000).toFixed(1) } };
+      
+      case "read_file": {
+        const content = fs.readFileSync(a.path, "utf8");
+        const stat = fs.statSync(a.path);
+        return { ok: true, out: content, meta: { lines: content.split("\n").length, size: stat.size } };
+      }
+      
       case "write_file": {
+        // Check if trying to write to system files
+        const absPath = path.resolve(a.path);
+        if (absPath.startsWith('/etc') || absPath.startsWith('/bin') || absPath.startsWith('/sbin')) {
+          return { ok: false, out: "Cannot write to system directories for safety" };
+        }
+        
         const dir = path.dirname(a.path);
         if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
         fs.writeFileSync(a.path, a.content);
-        return { ok: true, out: `File written: ${a.path}` };
+        return { ok: true, out: `File written: ${a.path}`, meta: { bytes: Buffer.byteLength(a.content) } };
       }
+      
       case "edit_file": {
+        const absPath = path.resolve(a.path);
+        if (absPath.startsWith('/etc') || absPath.startsWith('/bin') || absPath.startsWith('/sbin')) {
+          return { ok: false, out: "Cannot edit system files for safety" };
+        }
+        
         const orig = fs.readFileSync(a.path, "utf8");
         if (!orig.includes(a.old_text)) return { ok: false, out: "old_text not found in file" };
+        const count = orig.split(a.old_text).length - 1;
         fs.writeFileSync(a.path, orig.replace(a.old_text, a.new_text));
-        return { ok: true, out: `File edited: ${a.path}` };
+        return { ok: true, out: `File edited: ${a.path}`, meta: { replacements: count } };
       }
-      case "delete_file":
+      
+      case "delete_file": {
+        // Extra protection for home directory
+        const absPathDel = path.resolve(a.path);
+        if (absPathDel === HOME || absPathDel === path.dirname(HOME)) {
+          return { ok: false, out: "Cannot delete home directory for safety" };
+        }
+
+        // Check if file exists before deleting
+        if (!fs.existsSync(a.path)) {
+          return { ok: false, out: "File not found" };
+        }
+
+        let delSize = 0;
+        try { delSize = fs.statSync(a.path).size; } catch {}
         fs.rmSync(a.path, { recursive: true, force: true });
-        return { ok: true, out: `Deleted: ${a.path}` };
+        return { ok: true, out: `Deleted: ${a.path}`, meta: { size: delSize } };
+      }
+      
       case "search_files": {
         const dir = a.dir || process.cwd();
         const out = execSync(`find ${dir} -name "${a.pattern}" -type f 2>/dev/null | head -30`, { encoding: "utf8" });
         return { ok: true, out: out || "No files found." };
       }
+      
       case "search_content": {
         const dir = a.dir || process.cwd();
         const globArg = a.glob ? `--include="${a.glob}"` : "";
         const out = execSync(`grep -rn ${globArg} "${a.pattern}" ${dir} 2>/dev/null | head -30`, { encoding: "utf8" });
         return { ok: true, out: out || "No matches found." };
       }
+      
       default:
         return { ok: false, out: `Unknown tool: ${name}` };
     }
@@ -396,15 +505,210 @@ function toolLabel(name, a) {
 }
 
 // ═══════════════════════════════════════════════════════════
-//  Permission System
+//  Box-Drawn Tool Panels & Turn Footer
 // ═══════════════════════════════════════════════════════════
+function drawToolBox(type, lines, showPermission) {
+  const permTag = showPermission ? `── ⚡ ${C.yellow("Permission")} ──` : "";
+  const header = `─ ${type} `;
+  const pad = Math.max(0, 38 - header.length - (showPermission ? 16 : 0));
+  console.log(`  ${C.dim("╭")}${C.dim(header + "─".repeat(pad))}${permTag}`);
+  for (const l of lines) {
+    console.log(`  ${C.dim("│")} ${l}`);
+  }
+  console.log(`  ${C.dim("╰" + "─".repeat(40))}`);
+}
+
+function toolIcon(name) {
+  switch (name) {
+    case "read_file": return "📄";
+    case "write_file": return "📝";
+    case "edit_file": return "✏️";
+    case "delete_file": return "🗑️";
+    case "run_command": return "$";
+    case "search_files": return "🔍";
+    case "search_content": return "🔍";
+    default: return "⚙️";
+  }
+}
+
+function toolTypeName(name) {
+  switch (name) {
+    case "read_file": return "read";
+    case "write_file": return "write";
+    case "edit_file": return "edit";
+    case "delete_file": return "delete";
+    case "run_command": return "bash";
+    case "search_files": return "search";
+    case "search_content": return "grep";
+    default: return name;
+  }
+}
+
+function spinnerTextForTool(name, args) {
+  switch (name) {
+    case "read_file": return `Reading ${path.basename(args.path || "")}...`;
+    case "write_file": return `Writing ${path.basename(args.path || "")}...`;
+    case "edit_file": return `Editing ${path.basename(args.path || "")}...`;
+    case "delete_file": return `Deleting ${path.basename(args.path || "")}...`;
+    case "run_command": return `Running ${(args.command || "").substring(0, 30)}...`;
+    case "search_files": return `Searching ${args.pattern || ""}...`;
+    case "search_content": return `Grepping ${args.pattern || ""}...`;
+    default: return `Executing ${name}...`;
+  }
+}
+
+function showTurnFooter() {
+  if (!turnStats) return;
+  const elapsed = ((Date.now() - turnStats.startTime) / 1000).toFixed(1);
+  const inp = turnStats.turnTokens.input;
+  const out = turnStats.turnTokens.output;
+  const p = PRICING[config.model] || PRICING["deepseek-chat"];
+  const cost = ((inp / 1e6) * p.input + (out / 1e6) * p.output).toFixed(6);
+
+  let parts = [`${inp}↑ ${out}↓ tokens`, `$${cost}`, `${elapsed}s`];
+  const u = turnStats.toolsUsed;
+  if (u.read) parts.push(`${u.read} read`);
+  if (u.write) parts.push(`${u.write} write`);
+  if (u.edit) parts.push(`${u.edit} edit`);
+  if (u.delete) parts.push(`${u.delete} delete`);
+  if (u.command) parts.push(`${u.command} cmd`);
+  if (u.search) parts.push(`${u.search} search`);
+
+  const inner = parts.join(" · ");
+  console.log(C.dim(`\n  ━━ 📊 ${inner} ━━`));
+}
+
+// ═══════════════════════════════════════════════════════════
+//  ENHANCED PERMISSION SYSTEM WITH SAFETY CHECKS
+// ═══════════════════════════════════════════════════════════
+
+// Audit logging
+function logAudit(action, tool, args, allowed) {
+  const logEntry = {
+    timestamp: new Date().toISOString(),
+    action,
+    tool,
+    args: typeof args === 'object' ? JSON.stringify(args) : args,
+    allowed,
+    cwd: process.cwd(),
+    user: process.env.USER || 'unknown'
+  };
+  
+  const logFile = path.join(DS_DIR, "audit.log");
+  fs.appendFileSync(logFile, JSON.stringify(logEntry) + "\n");
+}
+
+// Check if path is safe (not system critical)
+function isSafePath(filePath) {
+  const unsafePaths = [
+    '/', '/bin', '/sbin', '/usr/bin', '/usr/sbin', '/etc', '/root',
+    '/system', '/data', '/dev', '/proc', '/sys',
+    '/data/data/com.termux/files/usr', // Termux system
+    '/data/data/com.termux/files/usr/bin',
+    '/data/data/com.termux/files/usr/lib'
+  ];
+  
+  const absPath = path.resolve(filePath);
+  
+  // Block system paths
+  for (const unsafe of unsafePaths) {
+    if (absPath.startsWith(unsafe)) {
+      return false;
+    }
+  }
+  
+  // Block home directory deletion
+  if (absPath === HOME || absPath.startsWith(HOME + '/.')) {
+    // Allow .deepseek folder operations (for config/sessions)
+    if (absPath.startsWith(path.join(HOME, '.deepseek'))) {
+      return true;
+    }
+    return false;
+  }
+  
+  // Allow storage access (internal storage)
+  if (absPath.startsWith('/storage/') || absPath.startsWith(HOME + '/storage/')) {
+    return true;
+  }
+  
+  return true;
+}
+
+// Check if command is dangerous
+function isDangerousCommand(cmd) {
+  const dangerousPatterns = [
+    'rm -rf', 'rm -fr', 'rm -r', 'rm -f',
+    'dd if=', 'mkfs', 'fdisk',
+    'chmod 777', 'chmod 000',
+    '> /dev/', '>> /dev/',
+    ':(){ :|:& };:', // fork bomb
+    'sudo', 'su '
+  ];
+  
+  const lowerCmd = cmd.toLowerCase();
+  return dangerousPatterns.some(pattern => lowerCmd.includes(pattern));
+}
+
+// Enhanced permission asking
 function askPermission(name, a) {
   return new Promise((resolve) => {
-    if (BYPASS_MODE || SAFE_TOOLS.includes(name)) return resolve(true);
-    console.log(`\n  ${C.yellow(C.bold("Permission Required"))}`);
+    // READONLY MODE: Block semua write/delete operations
+    if (READONLY_MODE && (WRITE_TOOLS.includes(name) || DANGEROUS_TOOLS.includes(name))) {
+      console.log(`\n  ${C.red(C.bold("READ-ONLY MODE BLOCKED"))}`);
+      console.log(`  ${toolLabel(name, a)}`);
+      console.log(`  ${C.red("Read-only mode aktif! Tidak bisa menulis/hapus.")}`);
+      logAudit("blocked_readonly", name, a, false);
+      return resolve(false);
+    }
+    
+    // BYPASS MODE: Skip permission untuk tools safe
+    if (BYPASS_MODE && SAFE_TOOLS.includes(name)) {
+      logAudit("auto_allowed_bypass", name, a, true);
+      return resolve(true);
+    }
+    
+    // SAFE TOOLS: Auto allow
+    if (SAFE_TOOLS.includes(name)) {
+      logAudit("auto_allowed_safe", name, a, true);
+      return resolve(true);
+    }
+    
+    // Additional safety checks
+    let safetyWarning = "";
+    
+    // Check for dangerous paths
+    if (a.path && !isSafePath(a.path)) {
+      safetyWarning = `${C.red("WARNING: Path mungkin berbahaya!")}\n  `;
+    }
+    
+    // Check for dangerous commands
+    if (name === "run_command" && a.command && isDangerousCommand(a.command)) {
+      safetyWarning = `${C.red("WARNING: Command mungkin berbahaya!")}\n  `;
+    }
+    
+    // Show permission dialog
+    console.log(`\n  ${C.yellow(C.bold("PERMISSION REQUIRED"))}`);
+    if (safetyWarning) console.log(`  ${safetyWarning}`);
     console.log(`  ${toolLabel(name, a)}`);
-    rl.question(`  ${C.yellow("Allow? (y/n):")} `, (ans) => {
-      resolve(ans.trim().toLowerCase() === "y" || ans.trim().toLowerCase() === "yes");
+    
+    rl.question(`  ${C.yellow("Allow this action? (y/n/details):")} `, (ans) => {
+      ans = ans.trim().toLowerCase();
+      
+      if (ans === 'details' || ans === 'd') {
+        console.log(`\n  ${C.cyan("Action Details:")}`);
+        console.log(`  Tool: ${name}`);
+        console.log(`  Arguments: ${JSON.stringify(a, null, 2)}`);
+        console.log(`  Current dir: ${process.cwd()}`);
+        rl.question(`  ${C.yellow("Allow? (y/n):")} `, (ans2) => {
+          const allowed = ans2.trim().toLowerCase() === 'y';
+          logAudit("user_decision", name, a, allowed);
+          resolve(allowed);
+        });
+      } else {
+        const allowed = ans === 'y' || ans === 'yes';
+        logAudit("user_decision", name, a, allowed);
+        resolve(allowed);
+      }
     });
   });
 }
@@ -620,22 +924,91 @@ async function processToolCalls(toolCallList) {
     let a;
     try { a = JSON.parse(tc.arguments); } catch { a = {}; }
 
+    const type = toolTypeName(tc.name);
+    const icon = toolIcon(tc.name);
     const safe = SAFE_TOOLS.includes(tc.name);
-    if (!safe) {
+    const needsPerm = !safe;
+
+    // Context-aware spinner (brief flash before execution)
+    startSpinner(spinnerTextForTool(tc.name, a));
+
+    if (needsPerm) {
+      stopSpinner();
+      // Build permission panel
+      const permLines = [];
+      if (tc.name === "run_command") {
+        permLines.push(`${icon} ${C.bold(a.command || "")}`);
+      } else {
+        permLines.push(`${icon} ${C.bold(a.path || "")}`);
+      }
+
+      const permTag = `── ⚡ ${C.yellow("Permission")} ──`;
+      const header = `─ ${type} `;
+      const pad = Math.max(0, 22 - header.length);
+      console.log(`\n  ${C.dim("╭")}${C.dim(header + "─".repeat(pad))}${permTag}`);
+      for (const l of permLines) console.log(`  ${C.dim("│")} ${l}`);
+
       const allowed = await askPermission(tc.name, a);
       if (!allowed) {
-        console.log(C.dim("  Denied."));
+        console.log(`  ${C.dim("│")} ${C.red("✗ Denied")}`);
+        console.log(`  ${C.dim("╰" + "─".repeat(40))}`);
+        logAction(tc.name, a, { ok: false, out: "Denied" }, 0);
         messages.push({ role: "tool", tool_call_id: tc.id, content: "Permission denied by user." });
         continue;
       }
     }
 
-    // Show action
-    console.log(`\n  ${toolLabel(tc.name, a)}`);
+    // Execute tool
+    stopSpinner();
+    const toolStart = Date.now();
     const result = executeTool(tc.name, a);
-    const icon = result.ok ? C.green("✓") : C.red("✗");
-    const preview = result.out.length > 300 ? result.out.substring(0, 300) + "..." : result.out;
-    console.log(`  ${icon} ${C.dim(preview)}`);
+    const dur = Date.now() - toolStart;
+    logAction(tc.name, a, result, dur);
+
+    // Build info lines for box
+    const boxLines = [];
+    const meta = result.meta || {};
+
+    if (tc.name === "read_file") {
+      boxLines.push(`${icon} ${C.bold(a.path)} ${C.dim(`(${meta.lines} lines, ${formatFileSize(meta.size)})`)}`);
+    } else if (tc.name === "write_file") {
+      boxLines.push(`${icon} ${C.bold(a.path)}`);
+      if (result.ok) boxLines.push(`${C.green("✓")} Written ${C.dim(`(${formatFileSize(meta.bytes)})`)}`);
+      else boxLines.push(`${C.red("✗")} ${result.out}`);
+    } else if (tc.name === "edit_file") {
+      boxLines.push(`${icon} ${C.bold(a.path)}`);
+      if (result.ok) boxLines.push(`${C.green("✓")} ${meta.replacements} replacement(s)`);
+      else boxLines.push(`${C.red("✗")} ${result.out}`);
+    } else if (tc.name === "delete_file") {
+      boxLines.push(`${icon} ${C.bold(a.path)}`);
+      if (result.ok) boxLines.push(`${C.green("✓")} Deleted ${C.dim(`(${formatFileSize(meta.size)})`)}`);
+      else boxLines.push(`${C.red("✗")} ${result.out}`);
+    } else if (tc.name === "run_command") {
+      boxLines.push(`${icon} ${C.bold(a.command)}`);
+      if (result.ok) {
+        const preview = result.out.length > 200 ? result.out.substring(0, 200) + "..." : result.out;
+        boxLines.push(`${C.green("✓")} ${C.dim(preview.replace(/\n/g, "\n  " + C.dim("│") + " "))}`);
+      } else {
+        boxLines.push(`${C.red("✗")} ${C.dim(result.out.substring(0, 200))}`);
+      }
+      boxLines.push(`⏱ ${meta.duration || ((dur / 1000).toFixed(1))}s`);
+    } else {
+      // search tools
+      boxLines.push(`${icon} ${C.bold(a.pattern || "")}`);
+      const preview = result.out.length > 200 ? result.out.substring(0, 200) + "..." : result.out;
+      const status = result.ok ? C.green("✓") : C.red("✗");
+      boxLines.push(`${status} ${C.dim(preview.replace(/\n/g, "\n  " + C.dim("│") + " "))}`);
+    }
+
+    if (needsPerm) {
+      // Already have open box from permission, add result lines and close
+      for (const l of boxLines) console.log(`  ${C.dim("│")} ${l}`);
+      console.log(`  ${C.dim("╰" + "─".repeat(40))}`);
+    } else {
+      // Draw full box for safe tools
+      console.log();
+      drawToolBox(type, boxLines, false);
+    }
 
     messages.push({ role: "tool", tool_call_id: tc.id, content: result.out });
   }
@@ -652,6 +1025,7 @@ async function chat() {
       await chat(); // Let model respond after tool results
     } else if (response.content) {
       messages.push({ role: "assistant", content: response.content });
+      showTurnFooter();
     }
   } catch (err) {
     console.error(`\n${C.red("Error:")} ${err.message}\n`);
@@ -679,6 +1053,7 @@ function handleCommand(input) {
 - **/load [name]** — Load session
 - **/sessions** — List saved sessions
 - **/tokens** — Show token usage & cost
+- **/log [n]** — Show session action log (default: 10)
 - **/config [key] [value]** — View/set config
 - **/compact** — Summarize conversation to save context
 - **/context** — Show detected project context
@@ -704,6 +1079,8 @@ function handleCommand(input) {
       messages.length = 0;
       messages.push({ role: "system", content: SYSTEM_PROMPT });
       sessionTokens = { input: 0, output: 0, reasoning: 0 };
+      turnCounter = 0;
+      sessionLog = [];
       console.log(C.dim("  Conversation cleared."));
       return true;
 
@@ -736,6 +1113,32 @@ function handleCommand(input) {
       console.log(`  Output: ${C.cyan(String(stats.output))}`);
       console.log(`  Total:  ${C.bold(String(stats.total))}`);
       console.log(`  Cost:   ${C.yellow(stats.cost)}`);
+      console.log();
+      return true;
+    }
+
+    case "/log": {
+      const n = parseInt(arg1) || 10;
+      if (sessionLog.length === 0) {
+        console.log(C.dim("  No actions logged yet."));
+        return true;
+      }
+      const entries = sessionLog.slice(-n);
+      console.log(C.bold(`\n  Session Log (last ${entries.length} of ${sessionLog.length}):`));
+      for (const e of entries) {
+        const time = e.timestamp.split("T")[1].split(".")[0];
+        const status = e.ok ? C.green("✓") : C.red("✗");
+        const dur = e.duration ? C.dim(`${e.duration}ms`) : "";
+        const toolName = C.cyan(e.tool);
+        let argStr = "";
+        if (e.args) {
+          if (e.args.path) argStr = e.args.path;
+          else if (e.args.command) argStr = e.args.command.substring(0, 40);
+          else if (e.args.pattern) argStr = e.args.pattern;
+        }
+        console.log(`  ${C.dim(time)} ${status} ${toolName} ${C.bold(argStr)} ${dur}`);
+        if (e.resultPreview) console.log(`    ${C.dim(e.resultPreview.substring(0, 80))}`);
+      }
       console.log();
       return true;
     }
@@ -776,6 +1179,38 @@ function handleCommand(input) {
       console.log();
       return true;
 
+    case "/safety":
+      console.log(renderMarkdown(`
+# Safety Information
+
+## Current Mode: ${READONLY_MODE ? "READ-ONLY" : BYPASS_MODE ? "BYPASS" : "SAFE"}
+
+## Safety Features:
+✅ **Permission System** - Always asks before dangerous operations
+✅ **Path Protection** - Blocks system-critical paths
+✅ **Command Filtering** - Blocks dangerous commands
+✅ **Audit Logging** - All actions are logged
+✅ **Read-Only Mode** - Completely safe for browsing
+
+## Protection Levels:
+1. **Safe Mode (ds)** - Always asks permission
+2. **Read-Only Mode (ds-ro)** - Can only read files
+3. **Sandbox Mode (ds-sandbox)** - Isolated folder
+4. **Bypass Mode (dsc)** - No permission prompts (use with caution!)
+
+## Blocked Operations:
+- Deleting system files
+- Writing to /etc, /bin, /sbin
+- Dangerous commands (rm -rf, dd, etc.)
+- Modifying home directory structure
+
+## Audit Log: ~/.deepseek/audit.log
+All actions are logged with timestamp and user decision.
+
+> Tip: Always use 'ds' for daily use. Use 'ds-ro' if you only need to read files.
+`));
+      return true;
+
     default:
       console.log(C.red(`  Unknown command: ${cmd}`));
       console.log(C.dim("  Type /help for available commands."));
@@ -801,7 +1236,7 @@ let multiLineBuffer = [];
 function prompt() {
   const promptStr = multiLineMode
     ? `${C.dim("...")} `
-    : `${C.green(C.bold(">"))} `;
+    : `${C.dim(`[${turnCounter + 1}]`)} ${C.green(C.bold(">"))} `;
 
   rl.question(promptStr, async (input) => {
     // Multi-line mode toggle
@@ -860,6 +1295,8 @@ function prompt() {
     }
 
     // Regular message
+    turnCounter++;
+    resetTurnStats();
     messages.push({ role: "user", content: trimmed });
     await chat();
     console.log();
@@ -874,14 +1311,28 @@ rl.on("close", () => {
 });
 
 // ═══════════════════════════════════════════════════════════
-//  Startup Banner
+//  Startup Banner with Safety Info
 // ═══════════════════════════════════════════════════════════
-const modeTag = BYPASS_MODE ? C.red(C.bold("BYPASS")) : C.green(C.bold("SAFE"));
+let modeTag, safetyInfo;
+
+if (READONLY_MODE) {
+  modeTag = C.blue(C.bold("READ-ONLY"));
+  safetyInfo = C.dim("  Only read operations allowed");
+} else if (BYPASS_MODE) {
+  modeTag = C.red(C.bold("BYPASS"));
+  safetyInfo = C.red("  ⚠️  Permission prompts DISABLED - Use with caution!");
+} else {
+  modeTag = C.green(C.bold("SAFE"));
+  safetyInfo = C.dim("  Permission prompts ENABLED");
+}
+
 const modelTag = C.cyan(config.model);
 
 console.log(`
 ${C.bold(C.cyan("  DeepSeek CLI"))}  ${modeTag}  ${modelTag}
+${safetyInfo}
 ${C.dim("  /help for commands — exit to quit — \"\"\" for multi-line")}
+${C.dim("  Type /safety for safety information")}
 `);
 
 prompt();
