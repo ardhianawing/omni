@@ -866,6 +866,34 @@ if (argResume) {
 }
 
 // ═══════════════════════════════════════════════════════════
+//  Interrupt Handling (Ctrl+C)
+// ═══════════════════════════════════════════════════════════
+let activeRequest = null;
+let isProcessing = false;
+
+process.on("SIGINT", () => {
+  if (activeRequest) {
+    // Abort current streaming request
+    activeRequest.destroy();
+    activeRequest = null;
+    isProcessing = false;
+    stopSpinner();
+    process.stdout.write(`\n${C.yellow("  ⏹ Interrupted")}\n\n`);
+    prompt();
+  } else if (isProcessing) {
+    // Abort tool processing
+    isProcessing = false;
+    stopSpinner();
+    process.stdout.write(`\n${C.yellow("  ⏹ Interrupted")}\n\n`);
+    prompt();
+  } else {
+    // At idle prompt — show hint, don't exit
+    process.stdout.write(`\n${C.dim("  Type 'exit' to quit")}\n`);
+    prompt();
+  }
+});
+
+// ═══════════════════════════════════════════════════════════
 //  API Streaming
 // ═══════════════════════════════════════════════════════════
 function isReasoningModel(model) {
@@ -911,6 +939,7 @@ function streamChat() {
     startSpinner(isReasoningModel(config.model) ? "Reasoning" : `${provider.name} thinking`);
 
     const req = https.request(options, (res) => {
+      activeRequest = req;
       if (res.statusCode !== 200) {
         stopSpinner();
         let err = "";
@@ -981,6 +1010,7 @@ function streamChat() {
       });
 
       res.on("end", () => {
+        activeRequest = null;
         stopSpinner();
         if (contentText || reasoningText) process.stdout.write("\n");
         trackUsage(usage);
@@ -988,7 +1018,7 @@ function streamChat() {
       });
     });
 
-    req.on("error", (err) => { stopSpinner(); reject(err); });
+    req.on("error", (err) => { activeRequest = null; stopSpinner(); reject(err); });
     req.write(data);
     req.end();
   });
@@ -1107,17 +1137,24 @@ async function processToolCalls(toolCallList) {
 //  Chat Loop
 // ═══════════════════════════════════════════════════════════
 async function chat() {
+  isProcessing = true;
   try {
     const response = await streamChat();
+    if (!isProcessing) return; // interrupted
     if (response.toolCalls.length > 0) {
       await processToolCalls(response.toolCalls);
+      if (!isProcessing) return; // interrupted during tools
       await chat(); // Let model respond after tool results
     } else if (response.content) {
       messages.push({ role: "assistant", content: response.content });
       showTurnFooter();
     }
   } catch (err) {
-    console.error(`\n${C.red("Error:")} ${err.message}\n`);
+    if (err.message !== "socket hang up" && err.code !== "ECONNRESET") {
+      console.error(`\n${C.red("Error:")} ${err.message}\n`);
+    }
+  } finally {
+    isProcessing = false;
   }
 }
 
@@ -1452,9 +1489,12 @@ function prompt() {
 }
 
 rl.on("close", () => {
-  saveHistory();
-  console.log(`\n${C.dim("Bye!")}\n`);
-  process.exit(0);
+  // Only exit on actual EOF (not Ctrl+C, which we handle via SIGINT)
+  if (!isProcessing && !activeRequest) {
+    saveHistory();
+    console.log(`\n${C.dim("Bye!")}\n`);
+    process.exit(0);
+  }
 });
 
 // ═══════════════════════════════════════════════════════════
