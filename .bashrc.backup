@@ -1,0 +1,13 @@
+export TMPDIR="$HOME/tmp"
+export TMP="$HOME/tmp"
+export TEMP="$HOME/tmp"
+
+# ═══════════════════════════════════════════════════════════
+# Fix /tmp error for Claude Code and other CLI tools
+# ═══════════════════════════════════════════════════════════
+export TMPDIR=$HOME/tmp
+mkdir -p $TMPDIR 2>/dev/null
+
+alias deepseek='node ~/ds.js'
+alias deepseek-bypass='node ~/ds.js --bypass'
+export DEEPSEEK_API_KEY='sk-72a0f1c0874e480f9143a773429fc1ae'
